@@ -10,6 +10,19 @@ export function AuthForm({ mode }: { mode: Mode }) {
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
 
+  async function parseResponse(response: Response): Promise<{ error?: string }> {
+    const text = await response.text();
+    if (!text) {
+      return {};
+    }
+
+    try {
+      return JSON.parse(text) as { error?: string };
+    } catch {
+      return {};
+    }
+  }
+
   async function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setPending(true);
@@ -28,7 +41,7 @@ export function AuthForm({ mode }: { mode: Mode }) {
       body: JSON.stringify(payload),
     });
 
-    const result = await response.json();
+    const result = await parseResponse(response);
     if (!response.ok) {
       setError(result.error ?? "Authentication failed");
       setPending(false);

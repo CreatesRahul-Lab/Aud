@@ -9,18 +9,36 @@ export function DashboardClient({ userName }: { userName: string }) {
   const [message, setMessage] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
 
+  async function parseResponse(response: Response): Promise<Record<string, unknown>> {
+    const text = await response.text();
+    if (!text) {
+      return {};
+    }
+
+    try {
+      return JSON.parse(text) as Record<string, unknown>;
+    } catch {
+      return {};
+    }
+  }
+
   async function createRoom() {
     setPending(true);
     setMessage(null);
     const response = await fetch("/api/rooms", { method: "POST" });
-    const data = await response.json();
+    const data = await parseResponse(response);
     setPending(false);
     if (!response.ok) {
-      setMessage(data.error ?? "Unable to create room");
+      setMessage(typeof data.error === "string" ? data.error : "Unable to create room");
       return;
     }
 
-    router.push(`/room/${data.room.code}`);
+    const room = data.room as { code?: string } | undefined;
+    if (!room?.code) {
+      setMessage("Invalid room response");
+      return;
+    }
+    router.push(`/room/${room.code}`);
   }
 
   async function uploadAudio(formData: FormData) {
@@ -30,14 +48,15 @@ export function DashboardClient({ userName }: { userName: string }) {
       method: "POST",
       body: formData,
     });
-    const data = await response.json();
+    const data = await parseResponse(response);
     setPending(false);
     if (!response.ok) {
-      setMessage(data.error ?? "Upload failed");
+      setMessage(typeof data.error === "string" ? data.error : "Upload failed");
       return;
     }
 
-    setMessage(`Uploaded track ${data.assetId}`);
+    const assetId = typeof data.assetId === "string" ? data.assetId : "unknown";
+    setMessage(`Uploaded track ${assetId}`);
   }
 
   async function handleJoin() {
