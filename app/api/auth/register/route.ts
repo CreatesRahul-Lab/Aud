@@ -2,6 +2,8 @@ import { NextResponse } from "next/server";
 import { getDb } from "@/lib/mongodb/client";
 import { createSessionToken, hashPassword, sessionCookieOptions, SESSION_COOKIE_NAME } from "@/lib/auth/session";
 
+export const runtime = "nodejs";
+
 export async function POST(request: Request) {
   try {
     const { email, password, name } = await request.json();

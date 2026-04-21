@@ -2,14 +2,14 @@ import { MongoClient, type Db } from "mongodb";
 
 const uri = process.env.MONGODB_URI ?? process.env.MONGO_URI ?? "";
 
-if (!uri) {
-  throw new Error("MONGODB_URI is required");
-}
-
 let client: MongoClient | null = null;
 let clientPromise: Promise<MongoClient> | null = null;
 
 export async function getMongoClient(): Promise<MongoClient> {
+  if (!uri) {
+    throw new Error("Missing MongoDB connection string. Set MONGODB_URI (or MONGO_URI).");
+  }
+
   if (client) {
     return client;
   }
