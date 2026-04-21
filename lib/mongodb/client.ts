@@ -1,6 +1,6 @@
 import { MongoClient, type Db } from "mongodb";
 
-const uri = process.env.MONGODB_URI ?? "";
+const uri = process.env.MONGODB_URI ?? process.env.MONGO_URI ?? "";
 
 if (!uri) {
   throw new Error("MONGODB_URI is required");
@@ -16,10 +16,13 @@ export async function getMongoClient(): Promise<MongoClient> {
 
   if (!clientPromise) {
     clientPromise = new MongoClient(uri, {
-      tls: true,
-      tlsAllowInvalidCertificates: false,
-      minPoolSize: 1,
+      // Let the MongoDB driver negotiate TLS for Atlas.
+      // For Vercel/serverless this avoids handshake issues caused by overly strict custom TLS flags.
+      family: 4,
+      minPoolSize: 0,
       maxPoolSize: 10,
+      maxIdleTimeMS: 30000,
+      serverSelectionTimeoutMS: 10000,
     }).connect();
   }
 
