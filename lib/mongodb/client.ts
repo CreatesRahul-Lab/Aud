@@ -15,7 +15,10 @@ export async function getMongoClient(): Promise<MongoClient> {
   }
 
   if (!clientPromise) {
-    clientPromise = new MongoClient(uri).connect();
+    clientPromise = new MongoClient(uri, {
+      tlsAllowInvalidCertificates: process.env.NODE_ENV !== "production",
+      retryWrites: false,
+    }).connect();
   }
 
   client = await clientPromise;
