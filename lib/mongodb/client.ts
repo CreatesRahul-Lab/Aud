@@ -1,8 +1,6 @@
 import { MongoClient, type Db } from "mongodb";
 
 const uri = process.env.MONGODB_URI ?? process.env.MONGO_URI ?? "";
-const allowInvalidCertificates = process.env.MONGODB_TLS_ALLOW_INVALID_CERTS === "true";
-const allowInvalidHostnames = process.env.MONGODB_TLS_ALLOW_INVALID_HOSTNAMES === "true";
 
 let client: MongoClient | null = null;
 let clientPromise: Promise<MongoClient> | null = null;
@@ -27,15 +25,13 @@ export async function getMongoClient(): Promise<MongoClient> {
 
   if (!clientPromise) {
     const mongoClient = new MongoClient(uri, {
-      tls: true,
-      tlsAllowInvalidCertificates: allowInvalidCertificates,
-      tlsAllowInvalidHostnames: allowInvalidHostnames,
-      family: 4,
+      // Do NOT set tls:true — mongodb+srv:// enables TLS automatically.
+      // Explicitly setting it causes SSL alert 80 on Vercel's OpenSSL.
       minPoolSize: 0,
       maxPoolSize: 10,
       maxIdleTimeMS: 30000,
-      serverSelectionTimeoutMS: 10000,
-      connectTimeoutMS: 10000,
+      serverSelectionTimeoutMS: 15000,
+      connectTimeoutMS: 15000,
       retryWrites: true,
     });
 
@@ -44,8 +40,6 @@ export async function getMongoClient(): Promise<MongoClient> {
         target: getMongoLabel(),
         nodeEnv: process.env.NODE_ENV,
         vercelRegion: process.env.VERCEL_REGION,
-        tlsAllowInvalidCertificates: allowInvalidCertificates,
-        tlsAllowInvalidHostnames: allowInvalidHostnames,
       });
       throw error;
     });

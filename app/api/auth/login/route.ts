@@ -33,7 +33,8 @@ export async function POST(request: Request) {
     response.cookies.set(SESSION_COOKIE_NAME, token, sessionCookieOptions());
     return response;
   } catch (error) {
-    console.error("Login error", error);
-    return NextResponse.json({ error: "Internal server error" }, { status: 500 });
+    const message = error instanceof Error ? error.message : String(error);
+    console.error("Login error:", message, error);
+    return NextResponse.json({ error: "Internal server error", detail: message }, { status: 500 });
   }
 }
