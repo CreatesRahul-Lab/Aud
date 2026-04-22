@@ -1,43 +1,50 @@
 import { NextResponse } from "next/server";
 import { getSessionUser } from "@/lib/auth/session";
-import { uploadAudioAsset } from "@/lib/audio/gridfs";
 import { getDb } from "@/lib/mongodb/client";
+import { nanoid } from "nanoid";
 
 export const runtime = "nodejs";
 
-// Disable Next.js body size limit — audio files can be large (50 MB+)
-export const maxDuration = 60; // seconds (Vercel hobby allows up to 60)
-
-
+/**
+ * POST /api/audio/upload
+ *
+ * Receives only metadata after the client has already uploaded the file
+ * directly to Cloudinary. No file bytes pass through this server, so
+ * Vercel's 4.5 MB body limit is never hit.
+ *
+ * Body (JSON):
+ *   { title, cloudinaryUrl, cloudinaryPublicId, fileName, contentType }
+ */
 export async function POST(request: Request) {
   const user = await getSessionUser();
   if (!user) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const formData = await request.formData();
-  const file = formData.get("file");
-  const title = String(formData.get("title") ?? "Untitled track");
-
-  if (!(file instanceof File)) {
-    return NextResponse.json({ error: "Audio file is required" }, { status: 400 });
+  let body: Record<string, unknown>;
+  try {
+    body = (await request.json()) as Record<string, unknown>;
+  } catch {
+    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
   }
 
+  const { title, cloudinaryUrl, cloudinaryPublicId, fileName, contentType } = body;
+
+  if (typeof cloudinaryUrl !== "string" || !cloudinaryUrl) {
+    return NextResponse.json({ error: "cloudinaryUrl is required" }, { status: 400 });
+  }
+
+  const assetId = nanoid();
   const db = await getDb();
-  const bytes = Buffer.from(await file.arrayBuffer());
-  const assetId = await uploadAudioAsset({
-    ownerId: user.userId,
-    fileName: file.name,
-    contentType: file.type || "audio/mpeg",
-    bytes,
-  });
 
   await db.collection("audioAssets").insertOne({
     assetId,
     ownerId: user.userId,
-    title,
-    fileName: file.name,
-    contentType: file.type || "audio/mpeg",
+    title: typeof title === "string" && title ? title : "Untitled track",
+    fileName: typeof fileName === "string" ? fileName : "",
+    contentType: typeof contentType === "string" ? contentType : "audio/mpeg",
+    cloudinaryUrl,
+    cloudinaryPublicId: typeof cloudinaryPublicId === "string" ? cloudinaryPublicId : null,
     createdAt: new Date(),
   });
 
