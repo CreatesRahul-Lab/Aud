@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, useCallback, useMemo } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import type { RoomState } from "@/types";
 
 export function RoomClient({
@@ -24,20 +24,29 @@ export function RoomClient({
   const joinedRef = useRef<Promise<void> | null>(null);
 
   const [state, setState] = useState<RoomState | null>(initialState);
-  const [volume, setVolume] = useState(initialState?.playback.volume ?? 1);
+  // Host's own local volume (not sent to server)
+  const [hostVolume, setHostVolume] = useState(1);
+  // Per-listener volumes keyed by clientId — only used on host's UI
+  const [listenerVolumes, setListenerVolumes] = useState<Record<string, number>>({});
+  // Listener's own current volume (set by host via room:volume)
+  const [myVolume, setMyVolume] = useState(initialState?.playback.volume ?? 1);
+
   const [duration, setDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
+
+  // Debounce timers per-listener clientId
+  const listenerDebounceRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
 
   const post = useCallback(async (endpoint: string, body: Record<string, unknown>) => {
     if (joinedRef.current) await joinedRef.current;
     return fetch(endpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ...body, clientId: clientIdRef.current }),
+      body: JSON.stringify(body),
     });
   }, []);
 
-  // SSE connection
+  // ── SSE connection ──────────────────────────────────────────────────────────
   useEffect(() => {
     const clientId = clientIdRef.current;
     const source = new EventSource(`/api/sse/${code}?clientId=${clientId}`);
@@ -53,9 +62,18 @@ export function RoomClient({
     source.addEventListener("room:state", (e) => {
       const nextState: RoomState = JSON.parse(e.data);
       setState(nextState);
-      const v = nextState.playback.volume;
-      setVolume(v);
-      if (audioRef.current) audioRef.current.volume = v;
+      // Seed any new listener into the volumes map at 100%
+      if (role === "host") {
+        setListenerVolumes((prev) => {
+          const next = { ...prev };
+          for (const p of nextState.participants) {
+            if (p.role === "listener" && !(p.clientId in next)) {
+              next[p.clientId] = 1;
+            }
+          }
+          return next;
+        });
+      }
     });
 
     source.addEventListener("room:play", (e) => {
@@ -86,17 +104,17 @@ export function RoomClient({
       audio.currentTime = playback.currentTime;
     });
 
-    // Host-pushed volume — applies to ALL clients (including host's own audio)
+    // Targeted volume — host set this client's volume specifically
     source.addEventListener("room:volume", (e) => {
       const { volume: v } = JSON.parse(e.data);
-      setVolume(v);
+      setMyVolume(v);
       if (audioRef.current) audioRef.current.volume = v;
     });
 
     return () => source.close();
   }, [code, role, userId, userName]);
 
-  // Keep seek bar in sync while playing
+  // ── Audio time tracking ─────────────────────────────────────────────────────
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio) return;
@@ -112,6 +130,7 @@ export function RoomClient({
     };
   });
 
+  // ── Host actions ────────────────────────────────────────────────────────────
   function emitPlay() {
     const audio = audioRef.current;
     if (!audio) return;
@@ -141,23 +160,23 @@ export function RoomClient({
     post("/api/room/track", { code, trackId });
   }
 
-  // Debounce timer so we only POST after the user stops dragging (150 ms)
-  const volumeDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Host's own local volume — no server call, just affects their own audio
+  function handleHostVolume(event: React.ChangeEvent<HTMLInputElement>) {
+    const v = Number(event.target.value);
+    setHostVolume(v);
+    if (audioRef.current) audioRef.current.volume = v;
+  }
 
-  // Host changes volume → apply immediately to own audio, debounce the broadcast
-  const emitVolume = useMemo(() => {
-    return (event: React.ChangeEvent<HTMLInputElement>) => {
-      const nextVolume = Number(event.target.value);
-      setVolume(nextVolume);
-      if (audioRef.current) audioRef.current.volume = nextVolume;
+  // Per-listener volume — debounced, POSTs to only that listener's device
+  function handleListenerVolume(targetClientId: string, v: number) {
+    setListenerVolumes((prev) => ({ ...prev, [targetClientId]: v }));
 
-      if (volumeDebounceRef.current) clearTimeout(volumeDebounceRef.current);
-      volumeDebounceRef.current = setTimeout(() => {
-        post("/api/room/volume", { code, volume: nextVolume });
-      }, 150);
-    };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [code, post]);
+    const timers = listenerDebounceRef.current;
+    if (timers[targetClientId]) clearTimeout(timers[targetClientId]);
+    timers[targetClientId] = setTimeout(() => {
+      post("/api/room/volume", { code, volume: v, targetClientId });
+    }, 150);
+  }
 
   function formatTime(s: number) {
     if (!isFinite(s)) return "0:00";
@@ -166,9 +185,16 @@ export function RoomClient({
     return `${m}:${sec.toString().padStart(2, "0")}`;
   }
 
+  const activeTrackTitle =
+    tracks.find((t) => t.assetId === state?.playback.trackId)?.title ?? null;
+
+  const listeners = state?.participants.filter((p) => p.role === "listener") ?? [];
+
+  // ── Render ──────────────────────────────────────────────────────────────────
   return (
     <div className="space-y-6">
-      <section className="rounded-3xl border border-white/10 bg-white/5 p-6 shadow-glow backdrop-blur">
+      {/* Header */}
+      <section className="rounded-3xl border border-white/10 bg-white/5 p-6 backdrop-blur">
         <p className="text-sm uppercase tracking-[0.35em] text-sky-300/80">Room {code}</p>
         <h1 className="mt-2 text-3xl font-semibold text-white">
           {role === "host" ? "Host dashboard" : "Listener view"}
@@ -178,10 +204,12 @@ export function RoomClient({
         </p>
       </section>
 
-      <section className="grid gap-6 lg:grid-cols-[1.5fr_1fr]">
-        <div className="rounded-3xl border border-white/10 bg-slate-950/50 p-6">
-          {role === "host" ? (
-            <label className="mb-4 block space-y-2 text-sm text-slate-300">
+      {role === "host" ? (
+        // ── HOST LAYOUT ────────────────────────────────────────────────────────
+        <section className="grid gap-6 lg:grid-cols-[1.5fr_1fr]">
+          {/* Playback controls */}
+          <div className="rounded-3xl border border-white/10 bg-slate-950/50 p-6 space-y-5">
+            <label className="block space-y-2 text-sm text-slate-300">
               <span>Active track</span>
               <select
                 value={state?.playback.trackId ?? ""}
@@ -196,96 +224,202 @@ export function RoomClient({
                 ))}
               </select>
             </label>
-          ) : null}
 
-          {/* Hidden audio element — listeners are driven by SSE events */}
+            {/* Hidden audio */}
+            <audio
+              ref={audioRef}
+              src={state?.playback.trackId ? `/api/audio/${state.playback.trackId}` : undefined}
+            />
+
+            <div className="flex flex-wrap gap-3">
+              <button
+                onClick={emitPlay}
+                className="rounded-2xl bg-sky-400 px-5 py-3 font-medium text-slate-950 hover:bg-sky-300 transition-colors"
+              >
+                ▶ Play
+              </button>
+              <button
+                onClick={emitPause}
+                className="rounded-2xl bg-white px-5 py-3 font-medium text-slate-950 hover:bg-slate-100 transition-colors"
+              >
+                ⏸ Pause
+              </button>
+            </div>
+
+            <label className="block space-y-2 text-sm text-slate-300">
+              <span>Seek — {formatTime(currentTime)} / {formatTime(duration)}</span>
+              <input
+                type="range"
+                min="0"
+                max={duration || 1}
+                step="0.1"
+                value={currentTime}
+                onChange={emitSeek}
+                className="w-full accent-sky-400"
+              />
+            </label>
+
+            <label className="block space-y-2 text-sm text-slate-300">
+              <span>My volume — {Math.round(hostVolume * 100)}%</span>
+              <input
+                type="range"
+                min="0"
+                max="1"
+                step="0.01"
+                value={hostVolume}
+                onChange={handleHostVolume}
+                className="w-full accent-sky-400"
+              />
+            </label>
+          </div>
+
+          {/* Participants + per-listener volume */}
+          <div className="rounded-3xl border border-white/10 bg-slate-950/50 p-6 space-y-4">
+            <h2 className="text-xl font-medium text-white">Participants</h2>
+
+            {/* Host row (no volume control for yourself here) */}
+            {state?.participants
+              .filter((p) => p.role === "host")
+              .map((p) => (
+                <div
+                  key={p.clientId}
+                  className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm"
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="font-medium text-white">{p.name}</span>
+                    <span className="flex items-center gap-2">
+                      <span className="text-xs text-sky-400 uppercase tracking-wide">host</span>
+                      <span className={`h-2 w-2 rounded-full ${p.connected ? "bg-emerald-400" : "bg-rose-400"}`} />
+                    </span>
+                  </div>
+                </div>
+              ))}
+
+            {/* Listener rows with per-listener volume */}
+            {listeners.length === 0 ? (
+              <p className="text-sm text-slate-500">No listeners yet.</p>
+            ) : (
+              listeners.map((p) => {
+                const vol = listenerVolumes[p.clientId] ?? 1;
+                return (
+                  <div
+                    key={p.clientId}
+                    className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm space-y-3"
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="font-medium text-white">{p.name}</span>
+                      <span className="flex items-center gap-2">
+                        <span className="text-xs text-violet-400 uppercase tracking-wide">listener</span>
+                        <span className={`h-2 w-2 rounded-full ${p.connected ? "bg-emerald-400" : "bg-rose-400"}`} />
+                      </span>
+                    </div>
+                    <label className="block space-y-1">
+                      <span className="text-xs text-slate-400">
+                        Volume: {Math.round(vol * 100)}%
+                        {!p.connected && (
+                          <span className="ml-2 text-rose-400">(offline)</span>
+                        )}
+                      </span>
+                      <input
+                        type="range"
+                        min="0"
+                        max="1"
+                        step="0.01"
+                        value={vol}
+                        disabled={!p.connected}
+                        onChange={(e) =>
+                          handleListenerVolume(p.clientId, Number(e.target.value))
+                        }
+                        className="w-full accent-violet-400 disabled:opacity-40"
+                      />
+                    </label>
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </section>
+      ) : (
+        // ── LISTENER LAYOUT ────────────────────────────────────────────────────
+        <section className="space-y-6">
+          {/* Hidden audio element — all control comes from host via SSE */}
           <audio
             ref={audioRef}
-            src={
-              state?.playback.trackId
-                ? `/api/audio/${state.playback.trackId}`
-                : undefined
-            }
+            src={state?.playback.trackId ? `/api/audio/${state.playback.trackId}` : undefined}
           />
 
-          {role === "host" ? (
-            <>
-              <div className="mt-2 flex flex-wrap gap-3">
-                <button
-                  onClick={emitPlay}
-                  className="rounded-2xl bg-sky-400 px-5 py-3 font-medium text-slate-950 hover:bg-sky-300 transition-colors"
+          {/* Now Playing card */}
+          <div className="rounded-3xl border border-white/10 bg-slate-950/50 p-6 space-y-4">
+            <p className="text-xs uppercase tracking-[0.3em] text-slate-500">Now Playing</p>
+            {activeTrackTitle ? (
+              <>
+                <p className="text-xl font-semibold text-white truncate">{activeTrackTitle}</p>
+                <div className="flex items-center gap-3">
+                  <span
+                    className={`flex h-8 w-8 items-center justify-center rounded-full text-sm ${
+                      state?.playback.isPlaying
+                        ? "bg-emerald-500/20 text-emerald-400"
+                        : "bg-slate-700/50 text-slate-400"
+                    }`}
+                  >
+                    {state?.playback.isPlaying ? "▶" : "⏸"}
+                  </span>
+                  <span className="text-sm text-slate-400">
+                    {state?.playback.isPlaying ? "Playing" : "Paused"} · controlled by host
+                  </span>
+                </div>
+              </>
+            ) : (
+              <p className="text-slate-500">Waiting for host to select a track…</p>
+            )}
+            <div className="flex items-center gap-2 rounded-2xl border border-white/5 bg-white/5 px-4 py-3">
+              <span className="text-lg">🔊</span>
+              <div className="flex-1">
+                <div
+                  className="h-2 rounded-full bg-violet-500/30"
+                  style={{ position: "relative" }}
                 >
-                  Play
-                </button>
-                <button
-                  onClick={emitPause}
-                  className="rounded-2xl bg-white px-5 py-3 font-medium text-slate-950 hover:bg-slate-100 transition-colors"
-                >
-                  Pause
-                </button>
+                  <div
+                    className="h-2 rounded-full bg-violet-400 transition-all"
+                    style={{ width: `${Math.round(myVolume * 100)}%` }}
+                  />
+                </div>
               </div>
-
-              <label className="mt-6 block space-y-2 text-sm text-slate-300">
-                <span>
-                  Seek — {formatTime(currentTime)} / {formatTime(duration)}
-                </span>
-                <input
-                  type="range"
-                  min="0"
-                  max={duration || 1}
-                  step="0.1"
-                  value={currentTime}
-                  onChange={emitSeek}
-                  className="w-full accent-sky-400"
-                />
-              </label>
-
-              <label className="mt-4 block space-y-2 text-sm text-slate-300">
-                <span>Volume (all devices): {Math.round(volume * 100)}%</span>
-                <input
-                  type="range"
-                  min="0"
-                  max="1"
-                  step="0.01"
-                  value={volume}
-                  onChange={emitVolume}
-                  className="w-full accent-violet-400"
-                />
-              </label>
-            </>
-          ) : (
-            <div className="mt-4 space-y-3">
-              <p className="text-sm text-slate-400">
-                Playback is controlled by the host. Your device follows the room in real time.
-              </p>
-              <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-slate-300">
-                <span className="text-slate-400">Volume set by host:</span>{" "}
-                <span className="font-medium text-white">{Math.round(volume * 100)}%</span>
-              </div>
+              <span className="text-xs text-slate-400 w-10 text-right">
+                {Math.round(myVolume * 100)}%
+              </span>
             </div>
-          )}
-        </div>
+            <p className="text-xs text-slate-600">Volume is set by the host for your device.</p>
+          </div>
 
-        <div className="rounded-3xl border border-white/10 bg-slate-950/50 p-6">
-          <h2 className="text-xl font-medium text-white">Participants</h2>
-          <div className="mt-4 space-y-3">
-            {state?.participants.map((participant) => (
+          {/* Participants */}
+          <div className="rounded-3xl border border-white/10 bg-slate-950/50 p-6 space-y-3">
+            <h2 className="text-xl font-medium text-white">Participants</h2>
+            {state?.participants.map((p) => (
               <div
-                key={participant.clientId}
-                className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-slate-200"
+                key={p.clientId}
+                className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm"
               >
-                <span className="font-medium">{participant.name}</span>
-                <span className="mx-2 text-slate-500">·</span>
-                <span className="text-slate-400">{participant.role}</span>
-                <span className="mx-2 text-slate-500">·</span>
-                <span className={participant.connected ? "text-emerald-400" : "text-rose-400"}>
-                  {participant.connected ? "online" : "offline"}
-                </span>
+                <div className="flex items-center justify-between">
+                  <span className="font-medium text-white">{p.name}</span>
+                  <span className="flex items-center gap-2">
+                    <span
+                      className={`text-xs uppercase tracking-wide ${
+                        p.role === "host" ? "text-sky-400" : "text-violet-400"
+                      }`}
+                    >
+                      {p.role}
+                    </span>
+                    <span
+                      className={`h-2 w-2 rounded-full ${p.connected ? "bg-emerald-400" : "bg-rose-400"}`}
+                    />
+                  </span>
+                </div>
               </div>
             ))}
           </div>
-        </div>
-      </section>
+        </section>
+      )}
     </div>
   );
 }
