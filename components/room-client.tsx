@@ -39,6 +39,21 @@ export function RoomClient({
   const [currentTime, setCurrentTime] = useState(0);
 
   const listenerDebounceRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  // For listeners: tracks the volume the host most recently mandated
+  const hostMandatedVolumeRef = useRef(initialState?.playback.volume ?? 1);
+  // Flag to suppress the volumechange guard when WE are setting audio.volume
+  const settingVolumeRef = useRef(false);
+
+  // ── Web Audio amplification (listeners only) ─────────────────────────────
+  // Routes audio through a GainNode (up to MAX_GAIN ×).  When the host pushes
+  // full volume, gain = MAX_GAIN, so even a 33 % system volume sounds full.
+  const MAX_GAIN = 3;
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const gainNodeRef = useRef<GainNode | null>(null);
+
+  // Vibration + full-screen nudge shown when host forces volume
+  const [showVolumeNudge, setShowVolumeNudge] = useState(false);
+  const nudgeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const post = useCallback(async (endpoint: string, body: Record<string, unknown>) => {
     if (joinedRef.current) await joinedRef.current;
@@ -52,6 +67,8 @@ export function RoomClient({
   // ── Helpers ─────────────────────────────────────────────────────────────────
 
   function safePlay(audio: HTMLAudioElement) {
+    // Resume the AudioContext every time we play (may have been auto-suspended)
+    audioCtxRef.current?.resume().catch(() => {});
     const p = audio.play();
     playPromiseRef.current = p;
     p.catch(() => {
@@ -60,8 +77,82 @@ export function RoomClient({
     return p;
   }
 
-  // Apply desiredRef state to the audio element, accounting for elapsed time
+  // Set up Web Audio pipeline for a listener: audio → compressor → gain → output.
+  // Called once on first play; safe to call repeatedly (idempotent).
+  function initWebAudio(audio: HTMLAudioElement) {
+    if (audioCtxRef.current) {
+      audioCtxRef.current.resume().catch(() => {});
+      return;
+    }
+    try {
+      const ctx = new AudioContext();
+      const src = ctx.createMediaElementSource(audio);
+
+      // Compressor keeps the boosted signal from clipping / distorting
+      const comp = ctx.createDynamicsCompressor();
+      comp.threshold.value = -18;
+      comp.knee.value = 12;
+      comp.ratio.value = 20;
+      comp.attack.value = 0.001;
+      comp.release.value = 0.1;
+
+      const gain = ctx.createGain();
+      gain.gain.value = hostMandatedVolumeRef.current * MAX_GAIN;
+
+      src.connect(comp);
+      comp.connect(gain);
+      gain.connect(ctx.destination);
+
+      // audio.volume is now the source-level input — lock it to 1 and let
+      // the GainNode handle all level control for maximum headroom.
+      settingVolumeRef.current = true;
+      audio.volume = 1;
+      settingVolumeRef.current = false;
+
+      audioCtxRef.current = ctx;
+      gainNodeRef.current = gain;
+    } catch {
+      // AudioContext not supported — fall back to audio.volume control
+    }
+  }
+
+  // Apply host-commanded volume to the listener's audio pipeline.
+  // If Web Audio is active: use GainNode (allows >1× amplification).
+  // Otherwise: fall back to audio.volume with the existing guard.
+  function applyVolumeToListener(v: number) {
+    hostMandatedVolumeRef.current = v;
+    const audio = audioRef.current;
+    if (!audio) return;
+
+    if (gainNodeRef.current && audioCtxRef.current) {
+      gainNodeRef.current.gain.value = v * MAX_GAIN;
+      audioCtxRef.current.resume().catch(() => {});
+      // Keep audio.volume at 1 so the source signal is always at maximum
+      settingVolumeRef.current = true;
+      audio.volume = 1;
+      settingVolumeRef.current = false;
+    } else {
+      settingVolumeRef.current = true;
+      audio.volume = v;
+      settingVolumeRef.current = false;
+    }
+  }
+
+  // Show the full-screen volume nudge and vibrate the device
+  function triggerVolumeNudge() {
+    navigator.vibrate?.([300, 150, 300, 150, 300]);
+    setShowVolumeNudge(true);
+    if (nudgeTimerRef.current) clearTimeout(nudgeTimerRef.current);
+    nudgeTimerRef.current = setTimeout(() => setShowVolumeNudge(false), 6000);
+  }
+
+  // Apply desiredRef state to the audio element, accounting for elapsed time.
+  // Also restores host-mandated volume for listeners (in case it was tampered with).
   function resyncAudio(audio: HTMLAudioElement, desired: DesiredPlayback) {
+    if (role === "listener") {
+      audioCtxRef.current?.resume().catch(() => {});
+      applyVolumeToListener(hostMandatedVolumeRef.current);
+    }
     if (desired.isPlaying) {
       const elapsed = (Date.now() - new Date(desired.updatedAt).getTime()) / 1000;
       const target = Math.min(desired.currentTime + elapsed, audio.duration || Infinity);
@@ -225,6 +316,8 @@ export function RoomClient({
       };
       const audio = audioRef.current;
       if (!audio) return;
+      // Init Web Audio on first play (requires an active audio element)
+      if (role === "listener") initWebAudio(audio);
       audio.currentTime = playback.currentTime;
       safePlay(audio);
       if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "playing";
@@ -257,11 +350,14 @@ export function RoomClient({
       audio.currentTime = playback.currentTime;
     });
 
-    // Targeted volume from host
+    // Targeted volume from host — amplify via GainNode + nudge listener
     source.addEventListener("room:volume", (e) => {
       const { volume: v } = JSON.parse(e.data);
+      // Displayed volume percentage is capped at 100 % even though gain goes to MAX_GAIN ×
       setMyVolume(v);
-      if (audioRef.current) audioRef.current.volume = v;
+      applyVolumeToListener(v);
+      // Vibrate + show nudge whenever host sets volume > 0
+      if (v > 0) triggerVolumeNudge();
     });
 
     return () => source.close();
@@ -292,14 +388,30 @@ export function RoomClient({
 
     const onDurationChange = () => setDuration(audio.duration || 0);
 
+    // Listeners only: if something external changes audio.volume, restore it.
+    // When Web Audio is active the target is always 1 (gain controls level).
+    // When falling back to audio.volume the target is hostMandatedVolumeRef.
+    const onVolumeChange = () => {
+      if (role !== "listener") return;
+      if (settingVolumeRef.current) return; // we set it — ignore
+      const target = gainNodeRef.current ? 1 : hostMandatedVolumeRef.current;
+      if (Math.abs(audio.volume - target) > 0.001) {
+        settingVolumeRef.current = true;
+        audio.volume = target;
+        settingVolumeRef.current = false;
+      }
+    };
+
     audio.addEventListener("timeupdate", onTimeUpdate);
     audio.addEventListener("durationchange", onDurationChange);
     audio.addEventListener("loadedmetadata", onDurationChange);
+    audio.addEventListener("volumechange", onVolumeChange);
 
     return () => {
       audio.removeEventListener("timeupdate", onTimeUpdate);
       audio.removeEventListener("durationchange", onDurationChange);
       audio.removeEventListener("loadedmetadata", onDurationChange);
+      audio.removeEventListener("volumechange", onVolumeChange);
     };
   });
 
@@ -356,6 +468,25 @@ export function RoomClient({
   // ── Render ───────────────────────────────────────────────────────────────────
   return (
     <div className="space-y-6">
+      {/* Full-screen nudge overlay — visible to listener when host forces volume */}
+      {role === "listener" && showVolumeNudge && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 backdrop-blur-sm p-6">
+          <div className="w-full max-w-sm rounded-3xl border border-violet-500/30 bg-slate-900 p-8 text-center space-y-5 shadow-2xl">
+            <div className="text-6xl animate-bounce">🔔</div>
+            <h2 className="text-2xl font-bold text-white">Turn up your volume!</h2>
+            <p className="text-slate-300 text-sm">
+              The host is playing music and has set your device volume.
+              Please turn up your phone volume so you can hear it.
+            </p>
+            <button
+              onClick={() => setShowVolumeNudge(false)}
+              className="w-full rounded-2xl bg-violet-500 py-3 font-semibold text-white hover:bg-violet-400 transition-colors"
+            >
+              Got it
+            </button>
+          </div>
+        </div>
+      )}
       {/* Header */}
       <section className="rounded-3xl border border-white/10 bg-white/5 p-6 backdrop-blur">
         <p className="text-sm uppercase tracking-[0.35em] text-sky-300/80">Room {code}</p>
@@ -389,6 +520,7 @@ export function RoomClient({
 
             <audio
               ref={audioRef}
+              playsInline
               src={state?.playback.trackId ? `/api/audio/${state.playback.trackId}` : undefined}
             />
 
@@ -480,6 +612,7 @@ export function RoomClient({
           {/* Hidden audio — all control via SSE + Media Session */}
           <audio
             ref={audioRef}
+            playsInline
             src={state?.playback.trackId ? `/api/audio/${state.playback.trackId}` : undefined}
           />
 
@@ -520,7 +653,7 @@ export function RoomClient({
               </span>
             </div>
             <p className="text-xs text-slate-600">
-              Volume is set by the host · music continues in background
+              Volume is set by the host · audio is amplified up to {MAX_GAIN}× to overcome low system volume
             </p>
           </div>
 
