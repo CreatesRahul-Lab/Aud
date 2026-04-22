@@ -5,6 +5,10 @@ import { getDb } from "@/lib/mongodb/client";
 
 export const runtime = "nodejs";
 
+// Disable Next.js body size limit — audio files can be large (50 MB+)
+export const maxDuration = 60; // seconds (Vercel hobby allows up to 60)
+
+
 export async function POST(request: Request) {
   const user = await getSessionUser();
   if (!user) {

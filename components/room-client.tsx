@@ -7,6 +7,7 @@ import type { SocketRoomState } from "@/types";
 export function RoomClient({ code, initialState, userId, userName, role, tracks }: { code: string; initialState: SocketRoomState | null; userId: string; userName: string; role: "host" | "listener"; tracks: Array<{ assetId: string; title: string }>; }) {
   const socketRef = useRef<Socket | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const playPromiseRef = useRef<Promise<void> | null>(null);
   const [state, setState] = useState<SocketRoomState | null>(initialState);
   const [volume, setVolume] = useState(initialState?.playback.volume ?? 1);
 
@@ -25,14 +26,19 @@ export function RoomClient({ code, initialState, userId, userName, role, tracks 
       const audio = audioRef.current;
       if (!audio) return;
       audio.currentTime = playback.currentTime;
-      void audio.play();
+      playPromiseRef.current = audio.play();
     });
 
     socket.on("room:pause", (playback) => {
       const audio = audioRef.current;
       if (!audio) return;
-      audio.currentTime = playback.currentTime;
-      audio.pause();
+      const settle = playPromiseRef.current ?? Promise.resolve();
+      settle.then(() => {
+        audio.currentTime = playback.currentTime;
+        audio.pause();
+      }).catch(() => {
+        // play was already aborted — nothing to do
+      });
     });
 
     socket.on("room:seek", (playback) => {
