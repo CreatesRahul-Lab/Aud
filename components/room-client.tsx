@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import type { RoomState } from "@/types";
 
 export function RoomClient({
@@ -141,13 +141,23 @@ export function RoomClient({
     post("/api/room/track", { code, trackId });
   }
 
-  // Host changes volume → broadcast to all listeners
-  function emitVolume(event: React.ChangeEvent<HTMLInputElement>) {
-    const nextVolume = Number(event.target.value);
-    setVolume(nextVolume);
-    if (audioRef.current) audioRef.current.volume = nextVolume;
-    post("/api/room/volume", { code, volume: nextVolume });
-  }
+  // Debounce timer so we only POST after the user stops dragging (150 ms)
+  const volumeDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Host changes volume → apply immediately to own audio, debounce the broadcast
+  const emitVolume = useMemo(() => {
+    return (event: React.ChangeEvent<HTMLInputElement>) => {
+      const nextVolume = Number(event.target.value);
+      setVolume(nextVolume);
+      if (audioRef.current) audioRef.current.volume = nextVolume;
+
+      if (volumeDebounceRef.current) clearTimeout(volumeDebounceRef.current);
+      volumeDebounceRef.current = setTimeout(() => {
+        post("/api/room/volume", { code, volume: nextVolume });
+      }, 150);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [code, post]);
 
   function formatTime(s: number) {
     if (!isFinite(s)) return "0:00";

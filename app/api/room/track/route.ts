@@ -1,15 +1,17 @@
 import { NextResponse } from "next/server";
-import { isHostClient, updateRoomState } from "@/lib/sse/state";
+import { verifyHost } from "@/lib/auth/verify-host";
+import { updateRoomState } from "@/lib/sse/state";
 import { broadcast } from "@/lib/sse/clients";
 
 export async function POST(request: Request) {
-  const { code, clientId, trackId } = await request.json();
+  const { code, trackId } = await request.json();
 
-  if (!code || !clientId) {
+  if (!code) {
     return NextResponse.json({ error: "Missing fields" }, { status: 400 });
   }
 
-  if (!isHostClient(clientId, code)) {
+  const userId = await verifyHost(code);
+  if (!userId) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 403 });
   }
 
