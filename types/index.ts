@@ -8,12 +8,12 @@ export type RoomPlaybackState = {
   updatedAt: string;
 };
 
-export type SocketRoomState = {
+export type RoomState = {
   code: string;
   hostUserId: string;
   participants: Array<{
     userId: string;
-    socketId: string;
+    clientId: string;
     name: string;
     role: Role;
     connected: boolean;

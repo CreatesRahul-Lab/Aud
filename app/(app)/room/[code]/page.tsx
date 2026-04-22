@@ -2,6 +2,7 @@ import { redirect } from "next/navigation";
 import { RoomClient } from "@/components/room-client";
 import { getSessionUser } from "@/lib/auth/session";
 import { getDb } from "@/lib/mongodb/client";
+import type { RoomState } from "@/types";
 
 type RoomPageProps = {
   params: Promise<{ code: string }>;
@@ -22,7 +23,7 @@ export default async function RoomPage({ params }: RoomPageProps) {
     <main className="mx-auto min-h-screen w-full max-w-6xl px-6 py-12">
       <RoomClient
         code={code}
-        initialState={room ? { code: room.code, hostUserId: room.hostUserId, participants: [], playback: room.playback } : null}
+        initialState={room ? { code: room.code as string, hostUserId: room.hostUserId as string, participants: [], playback: room.playback as RoomState["playback"] } : null}
         userId={user.userId}
         userName={user.name}
         role={room?.hostUserId === user.userId ? "host" : "listener"}

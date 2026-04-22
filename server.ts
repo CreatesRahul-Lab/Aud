@@ -1,9 +1,7 @@
 import "dotenv/config";
 import http from "http";
 import next from "next";
-import { Server as SocketIOServer } from "socket.io";
 import { parse } from "url";
-import { createSocketServer } from "@/lib/socket/server";
 import { ensureIndexes } from "@/lib/mongodb/indexes";
 
 const dev = process.env.NODE_ENV !== "production";
@@ -20,8 +18,6 @@ async function start() {
     const parsedUrl = parse(req.url ?? "", true);
     void handle(req, res, parsedUrl);
   });
-
-  createSocketServer(server, new SocketIOServer(server, { cors: { origin: true, credentials: true } }));
 
   server.listen(port, hostname, () => {
     console.log(`> Ready on http://${hostname}:${port}`);

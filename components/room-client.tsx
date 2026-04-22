@@ -1,75 +1,96 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import { io, type Socket } from "socket.io-client";
-import type { SocketRoomState } from "@/types";
+import { useEffect, useRef, useState, useCallback } from "react";
+import type { RoomState } from "@/types";
 
-export function RoomClient({ code, initialState, userId, userName, role, tracks }: { code: string; initialState: SocketRoomState | null; userId: string; userName: string; role: "host" | "listener"; tracks: Array<{ assetId: string; title: string }>; }) {
-  const socketRef = useRef<Socket | null>(null);
+export function RoomClient({ code, initialState, userId, userName, role, tracks }: { code: string; initialState: RoomState | null; userId: string; userName: string; role: "host" | "listener"; tracks: Array<{ assetId: string; title: string }>; }) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const playPromiseRef = useRef<Promise<void> | null>(null);
-  const [state, setState] = useState<SocketRoomState | null>(initialState);
+  const clientIdRef = useRef(crypto.randomUUID());
+  const joinedRef = useRef<Promise<void> | null>(null);
+  const [state, setState] = useState<RoomState | null>(initialState);
   const [volume, setVolume] = useState(initialState?.playback.volume ?? 1);
 
+  const post = useCallback(async (endpoint: string, body: Record<string, unknown>) => {
+    if (joinedRef.current) await joinedRef.current;
+    return fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...body, clientId: clientIdRef.current }),
+    });
+  }, []);
+
   useEffect(() => {
-    const socket = io(undefined, { path: "/socket.io" });
-    socketRef.current = socket;
+    const clientId = clientIdRef.current;
+    const source = new EventSource(`/api/sse/${code}?clientId=${clientId}`);
 
-    socket.emit("room:join", { code, userId, name: userName, role });
+    source.addEventListener("open", () => {
+      joinedRef.current = fetch("/api/room/join", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code, userId, name: userName, role, clientId }),
+      }).then(() => {});
+    });
 
-    socket.on("room:state", (nextState: SocketRoomState) => {
+    source.addEventListener("room:state", (e) => {
+      const nextState: RoomState = JSON.parse(e.data);
       setState(nextState);
       setVolume(nextState.playback.volume);
     });
 
-    socket.on("room:play", (playback) => {
+    source.addEventListener("room:play", (e) => {
+      const playback = JSON.parse(e.data);
       const audio = audioRef.current;
       if (!audio) return;
       audio.currentTime = playback.currentTime;
       playPromiseRef.current = audio.play();
     });
 
-    socket.on("room:pause", (playback) => {
+    source.addEventListener("room:pause", (e) => {
+      const playback = JSON.parse(e.data);
       const audio = audioRef.current;
       if (!audio) return;
       const settle = playPromiseRef.current ?? Promise.resolve();
       settle.then(() => {
         audio.currentTime = playback.currentTime;
         audio.pause();
-      }).catch(() => {
-        // play was already aborted — nothing to do
-      });
+      }).catch(() => {});
     });
 
-    socket.on("room:seek", (playback) => {
+    source.addEventListener("room:seek", (e) => {
+      const playback = JSON.parse(e.data);
       const audio = audioRef.current;
       if (!audio) return;
       audio.currentTime = playback.currentTime;
     });
 
     return () => {
-      socket.disconnect();
+      source.close();
     };
   }, [code, role, userId, userName]);
 
   function emitPlay() {
     const audio = audioRef.current;
-    if (!audio || !socketRef.current) return;
-    socketRef.current.emit("room:play", { code, currentTime: audio.currentTime, trackId: state?.playback.trackId ?? null });
+    if (!audio) return;
+    post("/api/room/play", { code, currentTime: audio.currentTime, trackId: state?.playback.trackId ?? null });
   }
 
   function emitPause() {
     const audio = audioRef.current;
-    if (!audio || !socketRef.current) return;
-    socketRef.current.emit("room:pause", { code, currentTime: audio.currentTime });
+    if (!audio) return;
+    post("/api/room/pause", { code, currentTime: audio.currentTime });
   }
 
   function emitSeek(event: React.ChangeEvent<HTMLInputElement>) {
     const audio = audioRef.current;
     const value = Number(event.target.value);
-    if (!audio || !socketRef.current) return;
+    if (!audio) return;
     audio.currentTime = value;
-    socketRef.current.emit("room:seek", { code, currentTime: value });
+    post("/api/room/seek", { code, currentTime: value });
+  }
+
+  function emitTrack(trackId: string | null) {
+    post("/api/room/track", { code, trackId });
   }
 
   function emitVolume(event: React.ChangeEvent<HTMLInputElement>) {
@@ -85,7 +106,7 @@ export function RoomClient({ code, initialState, userId, userName, role, tracks 
       <section className="rounded-3xl border border-white/10 bg-white/5 p-6 shadow-glow backdrop-blur">
         <p className="text-sm uppercase tracking-[0.35em] text-sky-300/80">Room {code}</p>
         <h1 className="mt-2 text-3xl font-semibold text-white">{role === "host" ? "Host dashboard" : "Listener view"}</h1>
-        <p className="mt-2 text-sm text-slate-300">Connected as {userName}. Playback remains local and synchronized through Socket.IO.</p>
+        <p className="mt-2 text-sm text-slate-300">Connected as {userName}. Playback is synchronized in real time via SSE.</p>
       </section>
 
       <section className="grid gap-6 lg:grid-cols-[1.5fr_1fr]">
@@ -95,7 +116,7 @@ export function RoomClient({ code, initialState, userId, userName, role, tracks 
               <span>Active track</span>
               <select
                 value={state?.playback.trackId ?? ""}
-                onChange={(event) => socketRef.current?.emit("room:track", { code, trackId: event.target.value || null })}
+                onChange={(event) => emitTrack(event.target.value || null)}
                 className="w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-white outline-none"
               >
                 <option value="">Select a track</option>
@@ -132,7 +153,7 @@ export function RoomClient({ code, initialState, userId, userName, role, tracks 
           <h2 className="text-xl font-medium text-white">Participants</h2>
           <div className="mt-4 space-y-3">
             {state?.participants.map((participant) => (
-              <div key={participant.socketId} className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-slate-200">
+              <div key={participant.clientId} className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-slate-200">
                 {participant.name} - {participant.role} {participant.connected ? "online" : "offline"}
               </div>
             ))}
