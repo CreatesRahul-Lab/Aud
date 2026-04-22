@@ -6,7 +6,7 @@ import type { RoomState } from "@/types";
 type DesiredPlayback = {
   isPlaying: boolean;
   currentTime: number;
-  updatedAt: string; // ISO — used to calculate drift when resuming from background
+  updatedAt: string;
 };
 
 export function RoomClient({
@@ -28,7 +28,6 @@ export function RoomClient({
   const playPromiseRef = useRef<Promise<void> | null>(null);
   const clientIdRef = useRef(crypto.randomUUID());
   const joinedRef = useRef<Promise<void> | null>(null);
-  // Last known server-commanded playback state — used to resync after backgrounding
   const desiredRef = useRef<DesiredPlayback | null>(null);
 
   const [state, setState] = useState<RoomState | null>(initialState);
@@ -38,20 +37,16 @@ export function RoomClient({
   const [duration, setDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
 
+  // Listener: has the user tapped "Enable audio"? Mobile browsers require a
+  // direct user gesture before audio.play() is permitted.
+  const [audioUnlocked, setAudioUnlocked] = useState(false);
+
+  // Volume guard refs
   const listenerDebounceRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
-  // For listeners: tracks the volume the host most recently mandated
   const hostMandatedVolumeRef = useRef(initialState?.playback.volume ?? 1);
-  // Flag to suppress the volumechange guard when WE are setting audio.volume
   const settingVolumeRef = useRef(false);
 
-  // ── Web Audio amplification (listeners only) ─────────────────────────────
-  // Routes audio through a GainNode (up to MAX_GAIN ×).  When the host pushes
-  // full volume, gain = MAX_GAIN, so even a 33 % system volume sounds full.
-  const MAX_GAIN = 3;
-  const audioCtxRef = useRef<AudioContext | null>(null);
-  const gainNodeRef = useRef<GainNode | null>(null);
-
-  // Vibration + full-screen nudge shown when host forces volume
+  // Vibration nudge
   const [showVolumeNudge, setShowVolumeNudge] = useState(false);
   const nudgeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -64,95 +59,26 @@ export function RoomClient({
     });
   }, []);
 
-  // ── Helpers ─────────────────────────────────────────────────────────────────
+  // ── Helpers ──────────────────────────────────────────────────────────────────
 
-  function safePlay(audio: HTMLAudioElement) {
-    // Resume the AudioContext every time we play (may have been auto-suspended)
-    audioCtxRef.current?.resume().catch(() => {});
-    const p = audio.play();
-    playPromiseRef.current = p;
-    p.catch(() => {
-      // Autoplay blocked — will retry on visibilitychange
-    });
-    return p;
-  }
-
-  // Set up Web Audio pipeline for a listener: audio → compressor → gain → output.
-  // Called once on first play; safe to call repeatedly (idempotent).
-  function initWebAudio(audio: HTMLAudioElement) {
-    if (audioCtxRef.current) {
-      audioCtxRef.current.resume().catch(() => {});
-      return;
-    }
-    try {
-      const ctx = new AudioContext();
-      const src = ctx.createMediaElementSource(audio);
-
-      // Compressor keeps the boosted signal from clipping / distorting
-      const comp = ctx.createDynamicsCompressor();
-      comp.threshold.value = -18;
-      comp.knee.value = 12;
-      comp.ratio.value = 20;
-      comp.attack.value = 0.001;
-      comp.release.value = 0.1;
-
-      const gain = ctx.createGain();
-      gain.gain.value = hostMandatedVolumeRef.current * MAX_GAIN;
-
-      src.connect(comp);
-      comp.connect(gain);
-      gain.connect(ctx.destination);
-
-      // audio.volume is now the source-level input — lock it to 1 and let
-      // the GainNode handle all level control for maximum headroom.
-      settingVolumeRef.current = true;
-      audio.volume = 1;
-      settingVolumeRef.current = false;
-
-      audioCtxRef.current = ctx;
-      gainNodeRef.current = gain;
-    } catch {
-      // AudioContext not supported — fall back to audio.volume control
-    }
-  }
-
-  // Apply host-commanded volume to the listener's audio pipeline.
-  // If Web Audio is active: use GainNode (allows >1× amplification).
-  // Otherwise: fall back to audio.volume with the existing guard.
-  function applyVolumeToListener(v: number) {
+  function setListenerVolume(v: number) {
     hostMandatedVolumeRef.current = v;
     const audio = audioRef.current;
     if (!audio) return;
-
-    if (gainNodeRef.current && audioCtxRef.current) {
-      gainNodeRef.current.gain.value = v * MAX_GAIN;
-      audioCtxRef.current.resume().catch(() => {});
-      // Keep audio.volume at 1 so the source signal is always at maximum
-      settingVolumeRef.current = true;
-      audio.volume = 1;
-      settingVolumeRef.current = false;
-    } else {
-      settingVolumeRef.current = true;
-      audio.volume = v;
-      settingVolumeRef.current = false;
-    }
+    settingVolumeRef.current = true;
+    audio.volume = v;
+    settingVolumeRef.current = false;
   }
 
-  // Show the full-screen volume nudge and vibrate the device
-  function triggerVolumeNudge() {
-    navigator.vibrate?.([300, 150, 300, 150, 300]);
-    setShowVolumeNudge(true);
-    if (nudgeTimerRef.current) clearTimeout(nudgeTimerRef.current);
-    nudgeTimerRef.current = setTimeout(() => setShowVolumeNudge(false), 6000);
+  function safePlay(audio: HTMLAudioElement) {
+    const p = audio.play();
+    playPromiseRef.current = p;
+    p.catch(() => {});
+    return p;
   }
 
-  // Apply desiredRef state to the audio element, accounting for elapsed time.
-  // Also restores host-mandated volume for listeners (in case it was tampered with).
   function resyncAudio(audio: HTMLAudioElement, desired: DesiredPlayback) {
-    if (role === "listener") {
-      audioCtxRef.current?.resume().catch(() => {});
-      applyVolumeToListener(hostMandatedVolumeRef.current);
-    }
+    if (role === "listener") setListenerVolume(hostMandatedVolumeRef.current);
     if (desired.isPlaying) {
       const elapsed = (Date.now() - new Date(desired.updatedAt).getTime()) / 1000;
       const target = Math.min(desired.currentTime + elapsed, audio.duration || Infinity);
@@ -167,11 +93,39 @@ export function RoomClient({
     }
   }
 
-  // ── Media Session ────────────────────────────────────────────────────────────
+  function triggerVolumeNudge() {
+    navigator.vibrate?.([300, 150, 300, 150, 300]);
+    setShowVolumeNudge(true);
+    if (nudgeTimerRef.current) clearTimeout(nudgeTimerRef.current);
+    nudgeTimerRef.current = setTimeout(() => setShowVolumeNudge(false), 6000);
+  }
 
-  const activeTrackTitle = tracks.find((t) => t.assetId === state?.playback.trackId)?.title ?? null;
+  // Called when listener taps "Enable audio" — provides the required user gesture
+  async function unlockAudio() {
+    const audio = audioRef.current;
+    if (!audio) return;
 
-  // Register / update metadata whenever the track changes
+    // Warm up the audio element so future SSE-triggered plays are allowed.
+    // On iOS this is the ONLY way to allow non-gesture audio.play() later.
+    try {
+      audio.volume = hostMandatedVolumeRef.current;
+      await audio.play();
+      audio.pause();
+    } catch {
+      // Ignore — element may not have a src yet; the gesture is still registered
+    }
+
+    setAudioUnlocked(true);
+
+    // If the host is already playing, catch up immediately
+    if (desiredRef.current) resyncAudio(audio, desiredRef.current);
+  }
+
+  // ── Media Session ─────────────────────────────────────────────────────────────
+
+  const activeTrackTitle =
+    tracks.find((t) => t.assetId === state?.playback.trackId)?.title ?? null;
+
   useEffect(() => {
     if (!("mediaSession" in navigator)) return;
     navigator.mediaSession.metadata = new MediaMetadata({
@@ -181,21 +135,18 @@ export function RoomClient({
     });
   }, [activeTrackTitle, code]);
 
-  // Sync OS playback state badge (playing / paused)
   useEffect(() => {
     if (!("mediaSession" in navigator)) return;
     navigator.mediaSession.playbackState =
       state?.playback.isPlaying ? "playing" : "paused";
   }, [state?.playback.isPlaying]);
 
-  // Register OS media-button action handlers (lock-screen ▶ / ⏸ buttons)
   useEffect(() => {
     if (!("mediaSession" in navigator)) return;
     const audio = audioRef.current;
     if (!audio) return;
 
     if (role === "host") {
-      // Host: lock-screen play/pause actually control playback
       navigator.mediaSession.setActionHandler("play", () => {
         const desired = desiredRef.current;
         if (desired) resyncAudio(audio, { ...desired, isPlaying: true });
@@ -207,54 +158,43 @@ export function RoomClient({
         settle.then(() => audio.pause()).catch(() => {});
         navigator.mediaSession.playbackState = "paused";
       });
+      navigator.mediaSession.setActionHandler("seekto", (d) => {
+        if (d.seekTime === undefined) return;
+        audio.currentTime = d.seekTime;
+        setCurrentTime(d.seekTime);
+        post("/api/room/seek", { code, currentTime: d.seekTime });
+      });
+      navigator.mediaSession.setActionHandler("seekbackward", (d) => {
+        const next = Math.max(0, audio.currentTime - (d.seekOffset ?? 10));
+        audio.currentTime = next;
+        setCurrentTime(next);
+        post("/api/room/seek", { code, currentTime: next });
+      });
+      navigator.mediaSession.setActionHandler("seekforward", (d) => {
+        const next = Math.min(audio.duration || Infinity, audio.currentTime + (d.seekOffset ?? 10));
+        audio.currentTime = next;
+        setCurrentTime(next);
+        post("/api/room/seek", { code, currentTime: next });
+      });
     } else {
-      // Listener: register no-ops so Media Session stays active (background audio)
-      // but the lock-screen buttons do nothing — only the host controls playback
+      // Listeners: no-ops keep Media Session alive for background audio
+      // but lock-screen buttons do nothing
       navigator.mediaSession.setActionHandler("play", () => {});
       navigator.mediaSession.setActionHandler("pause", () => {});
     }
 
-    // Host can also seek from lock screen; listeners follow server state only
-    if (role === "host") {
-      navigator.mediaSession.setActionHandler("seekto", (details) => {
-        if (details.seekTime === undefined) return;
-        audio.currentTime = details.seekTime;
-        setCurrentTime(details.seekTime);
-        post("/api/room/seek", { code, currentTime: details.seekTime });
-      });
-      navigator.mediaSession.setActionHandler("seekbackward", (details) => {
-        const skip = details.seekOffset ?? 10;
-        const next = Math.max(0, audio.currentTime - skip);
-        audio.currentTime = next;
-        setCurrentTime(next);
-        post("/api/room/seek", { code, currentTime: next });
-      });
-      navigator.mediaSession.setActionHandler("seekforward", (details) => {
-        const skip = details.seekOffset ?? 10;
-        const next = Math.min(audio.duration || Infinity, audio.currentTime + skip);
-        audio.currentTime = next;
-        setCurrentTime(next);
-        post("/api/room/seek", { code, currentTime: next });
-      });
-    }
-
     return () => {
       try {
-        navigator.mediaSession.setActionHandler("play", null);
-        navigator.mediaSession.setActionHandler("pause", null);
-        navigator.mediaSession.setActionHandler("seekto", null);
-        navigator.mediaSession.setActionHandler("seekbackward", null);
-        navigator.mediaSession.setActionHandler("seekforward", null);
-      } catch {
-        // some browsers throw when clearing handlers
-      }
+        ["play", "pause", "seekto", "seekbackward", "seekforward"].forEach((a) =>
+          navigator.mediaSession.setActionHandler(a as MediaSessionAction, null)
+        );
+      } catch { /* ignore */ }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [code, role, post]);
 
   // ── Visibility-change resync ─────────────────────────────────────────────────
-  // When user comes back from background / lock screen, recalculate the correct
-  // position accounting for the time elapsed while the page was hidden.
+
   useEffect(() => {
     function onVisible() {
       if (document.visibilityState !== "visible") return;
@@ -268,7 +208,8 @@ export function RoomClient({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ── SSE connection ───────────────────────────────────────────────────────────
+  // ── SSE connection ────────────────────────────────────────────────────────────
+
   useEffect(() => {
     const clientId = clientIdRef.current;
     const source = new EventSource(`/api/sse/${code}?clientId=${clientId}`);
@@ -285,7 +226,6 @@ export function RoomClient({
       const nextState: RoomState = JSON.parse(e.data);
       setState(nextState);
 
-      // Seed new listener volumes
       if (role === "host") {
         setListenerVolumes((prev) => {
           const next = { ...prev };
@@ -296,28 +236,19 @@ export function RoomClient({
         });
       }
 
-      // Sync audio with room state (e.g. on first join or reconnect)
       const pb = nextState.playback;
-      desiredRef.current = {
-        isPlaying: pb.isPlaying,
-        currentTime: pb.currentTime,
-        updatedAt: pb.updatedAt,
-      };
+      desiredRef.current = { isPlaying: pb.isPlaying, currentTime: pb.currentTime, updatedAt: pb.updatedAt };
       const audio = audioRef.current;
-      if (audio) resyncAudio(audio, desiredRef.current);
+      // Only sync audio if the listener has unlocked (or is the host)
+      if (audio && (role === "host" || audioUnlocked)) resyncAudio(audio, desiredRef.current);
     });
 
     source.addEventListener("room:play", (e) => {
       const playback = JSON.parse(e.data);
-      desiredRef.current = {
-        isPlaying: true,
-        currentTime: playback.currentTime,
-        updatedAt: playback.updatedAt,
-      };
+      desiredRef.current = { isPlaying: true, currentTime: playback.currentTime, updatedAt: playback.updatedAt };
       const audio = audioRef.current;
       if (!audio) return;
-      // Init Web Audio on first play (requires an active audio element)
-      if (role === "listener") initWebAudio(audio);
+      if (role === "listener" && !audioUnlocked) return; // wait for user tap
       audio.currentTime = playback.currentTime;
       safePlay(audio);
       if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "playing";
@@ -325,18 +256,11 @@ export function RoomClient({
 
     source.addEventListener("room:pause", (e) => {
       const playback = JSON.parse(e.data);
-      desiredRef.current = {
-        isPlaying: false,
-        currentTime: playback.currentTime,
-        updatedAt: playback.updatedAt,
-      };
+      desiredRef.current = { isPlaying: false, currentTime: playback.currentTime, updatedAt: playback.updatedAt };
       const audio = audioRef.current;
       if (!audio) return;
       const settle = playPromiseRef.current ?? Promise.resolve();
-      settle.then(() => {
-        audio.currentTime = playback.currentTime;
-        audio.pause();
-      }).catch(() => {});
+      settle.then(() => { audio.currentTime = playback.currentTime; audio.pause(); }).catch(() => {});
       if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "paused";
     });
 
@@ -346,31 +270,27 @@ export function RoomClient({
         desiredRef.current = { ...desiredRef.current, currentTime: playback.currentTime, updatedAt: playback.updatedAt };
       }
       const audio = audioRef.current;
-      if (!audio) return;
-      audio.currentTime = playback.currentTime;
+      if (audio) audio.currentTime = playback.currentTime;
     });
 
-    // Targeted volume from host — amplify via GainNode + nudge listener
     source.addEventListener("room:volume", (e) => {
       const { volume: v } = JSON.parse(e.data);
-      // Displayed volume percentage is capped at 100 % even though gain goes to MAX_GAIN ×
       setMyVolume(v);
-      applyVolumeToListener(v);
-      // Vibrate + show nudge whenever host sets volume > 0
+      setListenerVolume(v);
       if (v > 0) triggerVolumeNudge();
     });
 
     return () => source.close();
-  }, [code, role, userId, userName]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [code, role, userId, userName, audioUnlocked]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Audio element event listeners ────────────────────────────────────────────
+  // ── Audio element listeners ───────────────────────────────────────────────────
+
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio) return;
 
     const onTimeUpdate = () => {
       setCurrentTime(audio.currentTime);
-      // Keep lock-screen seek bar accurate
       if ("mediaSession" in navigator && "setPositionState" in navigator.mediaSession) {
         try {
           if (audio.duration && isFinite(audio.duration)) {
@@ -380,21 +300,16 @@ export function RoomClient({
               position: audio.currentTime,
             });
           }
-        } catch {
-          // setPositionState can throw if duration is not yet known
-        }
+        } catch { /* ignore */ }
       }
     };
-
     const onDurationChange = () => setDuration(audio.duration || 0);
 
-    // Listeners only: if something external changes audio.volume, restore it.
-    // When Web Audio is active the target is always 1 (gain controls level).
-    // When falling back to audio.volume the target is hostMandatedVolumeRef.
+    // Guard: if something external changes audio.volume on a listener, restore it
     const onVolumeChange = () => {
       if (role !== "listener") return;
-      if (settingVolumeRef.current) return; // we set it — ignore
-      const target = gainNodeRef.current ? 1 : hostMandatedVolumeRef.current;
+      if (settingVolumeRef.current) return;
+      const target = hostMandatedVolumeRef.current;
       if (Math.abs(audio.volume - target) > 0.001) {
         settingVolumeRef.current = true;
         audio.volume = target;
@@ -406,7 +321,6 @@ export function RoomClient({
     audio.addEventListener("durationchange", onDurationChange);
     audio.addEventListener("loadedmetadata", onDurationChange);
     audio.addEventListener("volumechange", onVolumeChange);
-
     return () => {
       audio.removeEventListener("timeupdate", onTimeUpdate);
       audio.removeEventListener("durationchange", onDurationChange);
@@ -415,7 +329,8 @@ export function RoomClient({
     };
   });
 
-  // ── Host actions ─────────────────────────────────────────────────────────────
+  // ── Host actions ──────────────────────────────────────────────────────────────
+
   function emitPlay() {
     const audio = audioRef.current;
     if (!audio) return;
@@ -428,9 +343,9 @@ export function RoomClient({
     post("/api/room/pause", { code, currentTime: audio.currentTime });
   }
 
-  function emitSeek(event: React.ChangeEvent<HTMLInputElement>) {
+  function emitSeek(e: React.ChangeEvent<HTMLInputElement>) {
     const audio = audioRef.current;
-    const value = Number(event.target.value);
+    const value = Number(e.target.value);
     if (!audio) return;
     audio.currentTime = value;
     setCurrentTime(value);
@@ -465,18 +380,17 @@ export function RoomClient({
 
   const listeners = state?.participants.filter((p) => p.role === "listener") ?? [];
 
-  // ── Render ───────────────────────────────────────────────────────────────────
+  // ── Render ────────────────────────────────────────────────────────────────────
   return (
     <div className="space-y-6">
-      {/* Full-screen nudge overlay — visible to listener when host forces volume */}
+      {/* Volume nudge overlay */}
       {role === "listener" && showVolumeNudge && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 backdrop-blur-sm p-6">
           <div className="w-full max-w-sm rounded-3xl border border-violet-500/30 bg-slate-900 p-8 text-center space-y-5 shadow-2xl">
             <div className="text-6xl animate-bounce">🔔</div>
             <h2 className="text-2xl font-bold text-white">Turn up your volume!</h2>
             <p className="text-slate-300 text-sm">
-              The host is playing music and has set your device volume.
-              Please turn up your phone volume so you can hear it.
+              The host is playing music for you. Please turn up your phone volume.
             </p>
             <button
               onClick={() => setShowVolumeNudge(false)}
@@ -487,6 +401,7 @@ export function RoomClient({
           </div>
         </div>
       )}
+
       {/* Header */}
       <section className="rounded-3xl border border-white/10 bg-white/5 p-6 backdrop-blur">
         <p className="text-sm uppercase tracking-[0.35em] text-sky-300/80">Room {code}</p>
@@ -499,7 +414,7 @@ export function RoomClient({
       </section>
 
       {role === "host" ? (
-        // ── HOST ──────────────────────────────────────────────────────────────
+        // ── HOST ───────────────────────────────────────────────────────────────
         <section className="grid gap-6 lg:grid-cols-[1.5fr_1fr]">
           <div className="rounded-3xl border border-white/10 bg-slate-950/50 p-6 space-y-5">
             <label className="block space-y-2 text-sm text-slate-300">
@@ -510,10 +425,8 @@ export function RoomClient({
                 className="w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-white outline-none"
               >
                 <option value="">Select a track</option>
-                {tracks.map((track) => (
-                  <option key={track.assetId} value={track.assetId}>
-                    {track.title}
-                  </option>
+                {tracks.map((t) => (
+                  <option key={t.assetId} value={t.assetId}>{t.title}</option>
                 ))}
               </select>
             </label>
@@ -525,40 +438,29 @@ export function RoomClient({
             />
 
             <div className="flex flex-wrap gap-3">
-              <button
-                onClick={emitPlay}
-                className="rounded-2xl bg-sky-400 px-5 py-3 font-medium text-slate-950 hover:bg-sky-300 transition-colors"
-              >
+              <button onClick={emitPlay}
+                className="rounded-2xl bg-sky-400 px-5 py-3 font-medium text-slate-950 hover:bg-sky-300 transition-colors">
                 ▶ Play
               </button>
-              <button
-                onClick={emitPause}
-                className="rounded-2xl bg-white px-5 py-3 font-medium text-slate-950 hover:bg-slate-100 transition-colors"
-              >
+              <button onClick={emitPause}
+                className="rounded-2xl bg-white px-5 py-3 font-medium text-slate-950 hover:bg-slate-100 transition-colors">
                 ⏸ Pause
               </button>
             </div>
 
             <label className="block space-y-2 text-sm text-slate-300">
               <span>Seek — {formatTime(currentTime)} / {formatTime(duration)}</span>
-              <input
-                type="range" min="0" max={duration || 1} step="0.1"
-                value={currentTime} onChange={emitSeek}
-                className="w-full accent-sky-400"
-              />
+              <input type="range" min="0" max={duration || 1} step="0.1"
+                value={currentTime} onChange={emitSeek} className="w-full accent-sky-400" />
             </label>
 
             <label className="block space-y-2 text-sm text-slate-300">
               <span>My volume — {Math.round(hostVolume * 100)}%</span>
-              <input
-                type="range" min="0" max="1" step="0.01"
-                value={hostVolume} onChange={handleHostVolume}
-                className="w-full accent-sky-400"
-              />
+              <input type="range" min="0" max="1" step="0.01"
+                value={hostVolume} onChange={handleHostVolume} className="w-full accent-sky-400" />
             </label>
           </div>
 
-          {/* Participants + per-listener volume */}
           <div className="rounded-3xl border border-white/10 bg-slate-950/50 p-6 space-y-4">
             <h2 className="text-xl font-medium text-white">Participants</h2>
 
@@ -576,86 +478,94 @@ export function RoomClient({
 
             {listeners.length === 0 ? (
               <p className="text-sm text-slate-500">No listeners yet.</p>
-            ) : (
-              listeners.map((p) => {
-                const vol = listenerVolumes[p.clientId] ?? 1;
-                return (
-                  <div key={p.clientId} className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm space-y-3">
-                    <div className="flex items-center justify-between">
-                      <span className="font-medium text-white">{p.name}</span>
-                      <span className="flex items-center gap-2">
-                        <span className="text-xs text-violet-400 uppercase tracking-wide">listener</span>
-                        <span className={`h-2 w-2 rounded-full ${p.connected ? "bg-emerald-400" : "bg-rose-400"}`} />
-                      </span>
-                    </div>
-                    <label className="block space-y-1">
-                      <span className="text-xs text-slate-400">
-                        Volume: {Math.round(vol * 100)}%
-                        {!p.connected && <span className="ml-2 text-rose-400">(offline)</span>}
-                      </span>
-                      <input
-                        type="range" min="0" max="1" step="0.01"
-                        value={vol} disabled={!p.connected}
-                        onChange={(e) => handleListenerVolume(p.clientId, Number(e.target.value))}
-                        className="w-full accent-violet-400 disabled:opacity-40"
-                      />
-                    </label>
+            ) : listeners.map((p) => {
+              const vol = listenerVolumes[p.clientId] ?? 1;
+              return (
+                <div key={p.clientId} className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm space-y-3">
+                  <div className="flex items-center justify-between">
+                    <span className="font-medium text-white">{p.name}</span>
+                    <span className="flex items-center gap-2">
+                      <span className="text-xs text-violet-400 uppercase tracking-wide">listener</span>
+                      <span className={`h-2 w-2 rounded-full ${p.connected ? "bg-emerald-400" : "bg-rose-400"}`} />
+                    </span>
                   </div>
-                );
-              })
-            )}
+                  <label className="block space-y-1">
+                    <span className="text-xs text-slate-400">
+                      Volume: {Math.round(vol * 100)}%
+                      {!p.connected && <span className="ml-2 text-rose-400">(offline)</span>}
+                    </span>
+                    <input type="range" min="0" max="1" step="0.01"
+                      value={vol} disabled={!p.connected}
+                      onChange={(e) => handleListenerVolume(p.clientId, Number(e.target.value))}
+                      className="w-full accent-violet-400 disabled:opacity-40" />
+                  </label>
+                </div>
+              );
+            })}
           </div>
         </section>
       ) : (
-        // ── LISTENER ──────────────────────────────────────────────────────────
+        // ── LISTENER ───────────────────────────────────────────────────────────
         <section className="space-y-6">
-          {/* Hidden audio — all control via SSE + Media Session */}
           <audio
             ref={audioRef}
             playsInline
             src={state?.playback.trackId ? `/api/audio/${state.playback.trackId}` : undefined}
           />
 
-          {/* Now Playing */}
-          <div className="rounded-3xl border border-white/10 bg-slate-950/50 p-6 space-y-4">
-            <p className="text-xs uppercase tracking-[0.3em] text-slate-500">Now Playing</p>
-            {activeTrackTitle ? (
-              <>
-                <p className="text-xl font-semibold text-white truncate">{activeTrackTitle}</p>
-                <div className="flex items-center gap-3">
-                  <span className={`flex h-8 w-8 items-center justify-center rounded-full text-sm ${
-                    state?.playback.isPlaying
-                      ? "bg-emerald-500/20 text-emerald-400"
-                      : "bg-slate-700/50 text-slate-400"
-                  }`}>
-                    {state?.playback.isPlaying ? "▶" : "⏸"}
-                  </span>
-                  <span className="text-sm text-slate-400">
-                    {state?.playback.isPlaying ? "Playing" : "Paused"} · controlled by host
-                  </span>
-                </div>
-              </>
-            ) : (
-              <p className="text-slate-500">Waiting for host to select a track…</p>
-            )}
-
-            {/* Volume bar */}
-            <div className="flex items-center gap-2 rounded-2xl border border-white/5 bg-white/5 px-4 py-3">
-              <span className="text-lg">🔊</span>
-              <div className="flex-1 h-2 rounded-full bg-violet-500/20">
-                <div
-                  className="h-2 rounded-full bg-violet-400 transition-all"
-                  style={{ width: `${Math.round(myVolume * 100)}%` }}
-                />
-              </div>
-              <span className="text-xs text-slate-400 w-10 text-right">
-                {Math.round(myVolume * 100)}%
-              </span>
+          {/* ── Audio unlock gate (mobile requires a user gesture first) ── */}
+          {!audioUnlocked ? (
+            <div className="rounded-3xl border border-sky-500/30 bg-sky-950/40 p-8 text-center space-y-5">
+              <div className="text-5xl">🎵</div>
+              <h2 className="text-xl font-semibold text-white">Tap to enable audio</h2>
+              <p className="text-sm text-slate-400">
+                Mobile browsers require a tap before audio can play.
+                Tap the button below once so music from the host reaches your device.
+              </p>
+              <button
+                onClick={unlockAudio}
+                className="w-full rounded-2xl bg-sky-500 py-4 text-lg font-bold text-white hover:bg-sky-400 active:scale-95 transition-all"
+              >
+                Enable Audio
+              </button>
             </div>
-            <p className="text-xs text-slate-600">
-              Volume is set by the host · audio is amplified up to {MAX_GAIN}× to overcome low system volume
-            </p>
-          </div>
+          ) : (
+            /* ── Now Playing (shown after unlock) ── */
+            <div className="rounded-3xl border border-white/10 bg-slate-950/50 p-6 space-y-4">
+              <p className="text-xs uppercase tracking-[0.3em] text-slate-500">Now Playing</p>
+              {activeTrackTitle ? (
+                <>
+                  <p className="text-xl font-semibold text-white truncate">{activeTrackTitle}</p>
+                  <div className="flex items-center gap-3">
+                    <span className={`flex h-8 w-8 items-center justify-center rounded-full text-sm ${
+                      state?.playback.isPlaying
+                        ? "bg-emerald-500/20 text-emerald-400"
+                        : "bg-slate-700/50 text-slate-400"
+                    }`}>
+                      {state?.playback.isPlaying ? "▶" : "⏸"}
+                    </span>
+                    <span className="text-sm text-slate-400">
+                      {state?.playback.isPlaying ? "Playing" : "Paused"} · controlled by host
+                    </span>
+                  </div>
+                </>
+              ) : (
+                <p className="text-slate-500">Waiting for host to select a track…</p>
+              )}
+
+              <div className="flex items-center gap-2 rounded-2xl border border-white/5 bg-white/5 px-4 py-3">
+                <span className="text-lg">🔊</span>
+                <div className="flex-1 h-2 rounded-full bg-violet-500/20">
+                  <div className="h-2 rounded-full bg-violet-400 transition-all"
+                    style={{ width: `${Math.round(myVolume * 100)}%` }} />
+                </div>
+                <span className="text-xs text-slate-400 w-10 text-right">
+                  {Math.round(myVolume * 100)}%
+                </span>
+              </div>
+              <p className="text-xs text-slate-600">Volume is set by the host for your device.</p>
+            </div>
+          )}
 
           {/* Participants */}
           <div className="rounded-3xl border border-white/10 bg-slate-950/50 p-6 space-y-3">
